@@ -203,11 +203,13 @@ echo "=== Step 7: Create demo users and assign roles ==="
 
 for user in alice bob; do
   echo "  Creating user: $user"
+  # Capitalize first letter portably (avoid ${user^}, which needs bash 4+).
+  first_name="$(echo "${user:0:1}" | tr '[:lower:]' '[:upper:]')${user:1}"
   kc_api POST "users" -d "{
     \"username\": \"$user\",
     \"enabled\": true,
     \"email\": \"$user@example.com\",
-    \"firstName\": \"${user^}\",
+    \"firstName\": \"$first_name\",
     \"lastName\": \"User\",
     \"credentials\": [{\"type\":\"password\",\"value\":\"$user\",\"temporary\":false}]
   }" > /dev/null || echo "    (may already exist)"
