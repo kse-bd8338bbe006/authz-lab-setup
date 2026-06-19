@@ -13,9 +13,16 @@ Before starting, make sure you have:
 
 ## Part 0: Setup (do this once before the practice)
 
-The `api-security` realm from previous lectures only has the `spa-token-demo` client and a `student` user, and neither OpenFGA nor `authz-demo` is deployed yet. Getting ready for this practice is three steps: **sync the deployment repo** (ArgoCD deploys OpenFGA + authz-demo), **create the databases**, and **configure Keycloak Authorization Services**.
+The `api-security` realm from previous lectures only has the `spa-token-demo` client and a `student` user, and neither OpenFGA nor `authz-demo` is deployed yet. Getting ready for this practice has a few steps that **must be done in this order**:
 
-The two setup scripts live in a dedicated repo, [`kse-bd8338bbe006/authz-lab-setup`](https://github.com/kse-bd8338bbe006/authz-lab-setup). Clone it once and run the scripts from there:
+1. **Point the deployment repo at your org** (0.1) - sync your `kse-labs-deployment` fork and rewrite the course org name to your own, so ArgoCD pulls images you can actually access.
+2. **Fork and build `authz-demo`** (0.2) - so your own container image lands in *your* GHCR and the build pushes the new image tag back into `kse-labs-deployment`.
+3. **Create the databases** (0.3) - OpenFGA and authz-demo each need a Postgres DB + Vault secret.
+4. **Configure Keycloak Authorization Services** (0.4).
+
+Steps 0.1 and 0.2 are coupled: the `authz-demo` build only updates the deployment repo if 0.1 has already renamed the org. Do them in order, or the build goes green without deploying anything (explained in 0.2).
+
+The two setup scripts (for 0.3 and 0.4) live in a dedicated repo, [`kse-bd8338bbe006/authz-lab-setup`](https://github.com/kse-bd8338bbe006/authz-lab-setup). Clone it once and run the scripts from there:
 
 ```bash
 git clone https://github.com/kse-bd8338bbe006/authz-lab-setup.git
@@ -23,9 +30,9 @@ git clone https://github.com/kse-bd8338bbe006/authz-lab-setup.git
 
 > Run the scripts from an interactive terminal - `openfga-db-setup.sh` uses `multipass exec` to reach the haproxy VM.
 
-### 0.1 Sync the deployment repo and deploy
+### 0.1 Sync the deployment repo and point it at your org
 
-The latest `kse-labs-deployment` manifests include OpenFGA (`infra/openfga/`) and `authz-demo` (`applications/authz-demo/`). Sync your fork and push so ArgoCD deploys them:
+The latest `kse-labs-deployment` manifests include OpenFGA (`infra/openfga/`) and `authz-demo` (`applications/authz-demo/`). Sync your fork so you have them:
 
 ```bash
 cd kse-labs-deployment
@@ -33,11 +40,61 @@ git pull origin main          # or: git fetch upstream && git merge upstream/mai
 git push origin main
 ```
 
-If you see merge conflicts in files you have customized (e.g., `infra/keycloak/realm-configmap.yaml`), keep your version - the Keycloak authorization config is added via the Admin API in step 0.3, not through the configmap.
+If you see merge conflicts in files you have customized (e.g., `infra/keycloak/realm-configmap.yaml`), keep your version - the Keycloak authorization config is added via the Admin API in step 0.4, not through the configmap.
 
-ArgoCD picks up the new `infra/openfga` and `applications/authz-demo` directories and deploys them. The pods start but stay `CrashLoopBackOff`/`Pending` until their database credentials exist - that is the next step.
+**Then rewrite the course org name to your own.** The synced manifests reference the course org `kse-bd8338bbe006` everywhere - including the image line `image: ghcr.io/kse-bd8338bbe006/authz-demo:...`. Your cluster **cannot pull from the course org's GHCR**, so repoint every reference at your own org (example org below: `kse-jdoe`):
 
-### 0.2 Create the databases
+```bash
+# still in kse-labs-deployment; BSD/macOS sed
+grep -rl "kse-bd8338bbe006" . | xargs sed -i '' 's/kse-bd8338bbe006/<your-org>/g'
+git add -A && git commit -m "Point deployment at my org" && git push
+```
+
+> On Linux (GNU sed) drop the empty argument: `sed -i 's/kse-bd8338bbe006/<your-org>/g'`.
+
+This rename is also what lets the `authz-demo` build update this repo later (0.2): its workflow rewrites `image: ghcr.io/<your-org>/authz-demo:...`, so if the org is still `kse-bd8338bbe006` the rewrite matches nothing and commits nothing.
+
+ArgoCD picks up the new `infra/openfga` and `applications/authz-demo` directories and deploys them. The pods start but stay `CrashLoopBackOff`/`Pending`/`ErrImagePull` until your own image exists in your GHCR (0.2) and their database credentials exist (0.3).
+
+### 0.2 Fork and build your own `authz-demo` image
+
+The deployment pulls the authz-demo container from a GHCR package. The course package lives under `kse-bd8338bbe006`, and **your team cannot pull from it** - the pod comes up `ErrImagePull`. You need your own image, in your own org's GHCR. This is the step that is easy to forget.
+
+1. **Fork [`kse-bd8338bbe006/authz-demo`](https://github.com/kse-bd8338bbe006/authz-demo) into your GitHub organization** - the same org you used in 0.1 (e.g. `kse-jdoe`). Use an **org**, not a personal account: the build's "make package public" step calls the org packages API, and the deploy step pushes to `<your-org>/kse-labs-deployment`.
+
+2. **Enable GitHub Actions on the fork.** Forks ship with Actions disabled: open the fork's **Actions** tab and click **"I understand my workflows, go ahead and enable them."**
+
+3. **Add the `DEPLOYMENT_PAT` secret to the `authz-demo` fork.** The build's last job (`update-deployment`) checks out *your* `kse-labs-deployment` and pushes the new image tag to it; that cross-repo push needs a token (the built-in `GITHUB_TOKEN` cannot write to another repo).
+   - Create a **classic** PAT: GitHub **Settings -> Developer settings -> Personal access tokens -> Tokens (classic) -> Generate new token (classic)**.
+   - Scope: check **`repo`** (full control of private repositories; this auto-selects `repo:status`, `repo_deployment`, `public_repo`, `repo:invite`, `security_events`).
+   - In the **authz-demo** fork: **Settings -> Secrets and variables -> Actions -> New repository secret**. Name it exactly **`DEPLOYMENT_PAT`** (the workflow reads `secrets.DEPLOYMENT_PAT`) and paste the token.
+
+4. **Trigger the build.** The workflow (`Main Build`) runs on **push to `main`**. From a local clone of your `authz-demo` fork, an empty commit is enough to kick it off:
+
+   ```bash
+   # from a local clone of your authz-demo fork
+   git commit --allow-empty -m "ci: trigger build"
+   git push
+   ```
+
+   (Or re-run it from the **Actions** tab.) The pipeline:
+   - builds arm64 + amd64 images, pushes them to **`ghcr.io/<your-org>/authz-demo`**, and stitches a multi-arch manifest tagged with the commit SHA (this creates the GHCR package),
+   - makes that package **public** so the cluster can pull it without a pull secret, and
+   - in the final `update-deployment` job, rewrites `image: ghcr.io/<your-org>/authz-demo:<sha>` in `applications/authz-demo/deployment.yaml` of your `kse-labs-deployment` fork, then commits and pushes it.
+
+> **Why a green build can still deploy nothing.** The deploy job only commits when the rewrite actually changed a line (`git diff --cached --quiet || (git commit && git push)`). If you skipped the org rename in 0.1, the file still reads `ghcr.io/kse-bd8338bbe006/authz-demo` while the workflow searches for `ghcr.io/<your-org>/authz-demo` - no match, no diff, no commit. The run is **green, but nothing is deployed**. This is why 0.1 must come first.
+
+After the build finishes, confirm the deploy commit landed and the image tag is yours:
+
+```bash
+git -C kse-labs-deployment pull origin main   # expect a "deploy: authz-demo <sha>" commit
+grep -n "image: ghcr.io" kse-labs-deployment/applications/authz-demo/deployment.yaml
+kubectl -n applications get pods -l app.kubernetes.io/name=authz-demo
+```
+
+If the pod stays `ErrImagePull`: either the deploy job never committed (the tag in `deployment.yaml` does not exist in your GHCR - re-check 0.1 and the `DEPLOYMENT_PAT`), or the package is still private (re-run the build so its "make package public" step runs).
+
+### 0.3 Create the databases
 
 OpenFGA and authz-demo each need a Postgres database on the shared instance on the haproxy VM (`192.168.50.10:5432`). From the cloned repo:
 
@@ -87,7 +144,7 @@ kubectl -n applications get pods -l app.kubernetes.io/name=authz-demo
 curl -sk https://authz-demo.192.168.50.10.nip.io/api/health
 ```
 
-### 0.3 Configure Keycloak Authorization Services
+### 0.4 Configure Keycloak Authorization Services
 
 ```bash
 cd authz-lab-setup
@@ -116,7 +173,7 @@ After the script completes, verify in the Keycloak admin console (`https://keycl
 - **Realm roles** shows `document-viewer`, `document-editor`, `document-admin`
 - **Users** shows `alice` (with `document-admin` role) and `bob` (with `document-viewer` role)
 
-### 0.4 Verify the full setup
+### 0.5 Verify the full setup
 
 Before moving to Part 1, verify everything is in place:
 
